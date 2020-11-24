@@ -49,7 +49,7 @@
 
 /* Default memory limit for child process (MB): */
 
-#ifndef __x86_64__ 
+#ifndef __x86_64__
 #  define MEM_LIMIT         25
 #else
 #  define MEM_LIMIT         50
@@ -88,8 +88,11 @@
 
 #define HAVOC_MIN           16
 
+#define POWER_BETA          1
+#define MAX_FACTOR          (POWER_BETA * 32)
+
 /* Maximum stacking for havoc-stage tweaks. The actual value is calculated
-   like this: 
+   like this:
 
    n = random between 1 and HAVOC_STACK_POW2
    stacking = 2^n
