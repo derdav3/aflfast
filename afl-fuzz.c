@@ -1250,6 +1250,7 @@ static void minimize_bits(u8* dst, u8* src) {
 static void update_bitmap_score(struct queue_entry* q) {
 
   u32 i;
+  u64 fuzz_p2      = next_p2 (q->n_fuzz);
   u64 fav_factor = q->exec_us * q->len;
 
   /* For every byte set in trace_bits[], see if there is a previous winner,
@@ -8049,6 +8050,7 @@ int main(int argc, char** argv) {
     case QUAD:    OKF ("Using quadratic power schedule (QUAD)"); break;
     case EXPLORE: OKF ("Using exploration-based constant power schedule (EXPLORE)"); break;
     default : FATAL ("Unkown power schedule"); break;
+  }
 
   if (getenv("AFL_NO_FORKSRV"))    no_forkserver    = 1;
   if (getenv("AFL_NO_CPU_RED"))    no_cpu_meter_red = 1;
