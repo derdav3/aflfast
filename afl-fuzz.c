@@ -6,7 +6,7 @@
 
    Forkserver design by Jann Horn <jannhorn@googlemail.com>
 
-   Copyright 2013, 2014, 2015, 2016 Google Inc. All rights reserved.
+   Copyright 2013, 2014, 2015, 2016, 2017 Google Inc. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -98,16 +98,6 @@ EXP_ST u64 mem_limit  = MEM_LIMIT;    /* Memory cap for child (MB)        */
 
 static u32 stats_update_freq = 1;     /* Stats update frequency (execs)   */
 
-static u8 schedule = 0;               /* Power schedule (default: FAST)   */
-enum {
-  /* 00 */ FAST,                      /* Exponential schedule             */
-  /* 01 */ COE,                       /* Cut-Off Exponential schedule     */
-  /* 02 */ EXPLORE,                   /* Exploration-based constant sch.  */
-  /* 03 */ LIN,                       /* Linear schedule                  */
-  /* 04 */ QUAD,                      /* Quadratic schedule               */
-  /* 05 */ EXPLOIT                    /* AFL's exploitation-based const.  */
-};
-
 EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            force_deterministic,       /* Force deterministic stages?      */
            use_splicing,              /* Recombine input files?           */
@@ -131,6 +121,7 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            skip_requested,            /* Skip request, via SIGUSR1        */
            run_over10m,               /* Run time over 10 minutes?        */
            persistent_mode,           /* Running in persistent mode?      */
+           deferred_mode,             /* Deferred forkserver mode?        */
            fast_cal;                  /* Try to calibrate faster?         */
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
@@ -239,6 +230,7 @@ struct queue_entry {
 
   u8  cal_failed,                     /* Calibration failed?              */
       trim_done,                      /* Trimmed?                         */
+      was_fuzzed,                     /* Had any fuzzing done yet?        */
       passed_det,                     /* Deterministic stages passed?     */
       has_new_cov,                    /* Triggers new coverage?           */
       var_behavior,                   /* Variable behavior?               */
@@ -246,19 +238,18 @@ struct queue_entry {
       fs_redundant;                   /* Marked as redundant in the fs?   */
 
   u32 bitmap_size,                    /* Number of bits set in bitmap     */
-      fuzz_level,                     /* Number of fuzzing iterations     */
       exec_cksum;                     /* Checksum of the execution trace  */
 
   u64 exec_us,                        /* Execution time (us)              */
       handicap,                       /* Number of queue cycles behind    */
-      depth,                          /* Path depth                       */
-      n_fuzz;                         /* Number of fuzz, does not overflow */
+      depth;                          /* Path depth                       */
 
   u8* trace_mini;                     /* Trace bytes, if kept             */
   u32 tc_ref;                         /* Trace bytes ref count            */
 
   struct queue_entry *next,           /* Next element, if any             */
                      *next_100;       /* 100 elements ahead               */
+
 };
 
 static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
@@ -330,7 +321,6 @@ enum {
   /* 05 */ FAULT_NOBITS
 };
 
-static u64 next_p2(u64 val);
 
 /* Get unix time in milliseconds */
 
@@ -791,7 +781,6 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->len          = len;
   q->depth        = cur_depth + 1;
   q->passed_det   = passed_det;
-  q->n_fuzz       = 1;
 
   if (q->depth > max_depth) max_depth = q->depth;
 
@@ -1244,11 +1233,9 @@ static void minimize_bits(u8* dst, u8* src) {
    for every byte in the bitmap. We win that slot if there is no previous
    contender, or if the contender has a more favorable speed x size factor. */
 
-
 static void update_bitmap_score(struct queue_entry* q) {
 
   u32 i;
-  u64 fuzz_p2      = next_p2 (q->n_fuzz);
   u64 fav_factor = q->exec_us * q->len;
 
   /* For every byte set in trace_bits[], see if there is a previous winner,
@@ -1260,15 +1247,9 @@ static void update_bitmap_score(struct queue_entry* q) {
 
        if (top_rated[i]) {
 
-         u64 top_rated_fuzz_p2    = next_p2 (top_rated[i]->n_fuzz);
-         u64 top_rated_fav_factor = top_rated[i]->exec_us * top_rated[i]->len;
+         /* Faster-executing or smaller test cases are favored. */
 
-         if (fuzz_p2 > top_rated_fuzz_p2) continue;
-         else if (fuzz_p2 == top_rated_fuzz_p2) {
-
-           if (fav_factor > top_rated_fav_factor) continue;
-
-         }
+         if (fav_factor > top_rated[i]->exec_us * top_rated[i]->len) continue;
 
          /* Looks like we're going to win. Decrease ref count for the
             previous winner, discard its trace_bits[] if necessary. */
@@ -1342,7 +1323,7 @@ static void cull_queue(void) {
       top_rated[i]->favored = 1;
       queued_favored++;
 
-      if (top_rated[i]->fuzz_level == 0) pending_favored++;
+      if (!top_rated[i]->was_fuzzed) pending_favored++;
 
     }
 
@@ -3140,18 +3121,6 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
   s32 fd;
   u8  keeping = 0, res;
 
-  /* Update path frequency. */
-  u32 cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
-
-  struct queue_entry* q = queue;
-  while (q) {
-    if (q->exec_cksum == cksum)
-      q->n_fuzz = q->n_fuzz + 1;
-
-    q = q->next;
-
-  }
-
   if (fault == crash_mode) {
 
     /* Keep only if there are new bits in the map, add to queue for
@@ -3160,7 +3129,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     if (!(hnb = has_new_bits(virgin_bits))) {
       if (crash_mode) total_crashes++;
       return 0;
-    }
+    }    
 
 #ifndef SIMPLE_FILES
 
@@ -3180,7 +3149,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       queued_with_cov++;
     }
 
-    queue_top->exec_cksum = cksum;
+    queue_top->exec_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
 
     /* Try to calibrate inline; this also calls update_bitmap_score() when
        successful. */
@@ -3460,6 +3429,7 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
              "exec_timeout      : %u\n"
              "afl_banner        : %s\n"
              "afl_version       : " VERSION "\n"
+             "target_mode       : %s%s%s%s%s%s%s\n"
              "command_line      : %s\n",
              start_time / 1000, get_cur_time() / 1000, getpid(),
              queue_cycle ? (queue_cycle - 1) : 0, total_execs, eps,
@@ -3468,7 +3438,13 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
              queued_variable, stability, bitmap_cvg, unique_crashes,
              unique_hangs, last_path_time / 1000, last_crash_time / 1000,
              last_hang_time / 1000, total_execs - last_crash_execs,
-             exec_tmout, use_banner, orig_cmdline);
+             exec_tmout, use_banner,
+             qemu_mode ? "qemu " : "", dumb_mode ? " dumb " : "",
+             no_forkserver ? "no_forksrv " : "", crash_mode ? "crash " : "",
+             persistent_mode ? "persistent " : "", deferred_mode ? "deferred " : "",
+             (qemu_mode || dumb_mode || no_forkserver || crash_mode ||
+              persistent_mode || deferred_mode) ? "" : "default",
+             orig_cmdline);
              /* ignore errors */
 
   fclose(f);
@@ -4018,7 +3994,7 @@ static void show_stats(void) {
 
   sprintf(tmp + banner_pad, "%s " cLCY VERSION cLGN
           " (%s)",  crash_mode ? cPIN "peruvian were-rabbit" : 
-          cYEL "american fuzzy lop (fast)", use_banner);
+          cYEL "american fuzzy lop", use_banner);
 
   SAYF("\n%s\n\n", tmp);
 
@@ -4117,8 +4093,8 @@ static void show_stats(void) {
      together, but then cram them into a fixed-width field - so we need to
      put them in a temporary buffer first. */
 
-  sprintf(tmp, "%s%s%d (%0.02f%%)", DI(current_entry),
-          queue_cur->favored ? "." : "*", queue_cur->fuzz_level,
+  sprintf(tmp, "%s%s (%0.02f%%)", DI(current_entry),
+          queue_cur->favored ? "" : "*",
           ((double)current_entry * 100) / queued_paths);
 
   SAYF(bV bSTOP "  now processing : " cRST "%-17s " bSTG bV bSTOP, tmp);
@@ -4469,11 +4445,11 @@ static void show_init_stats(void) {
 
 
 /* Find first power of two greater or equal to val (assuming val under
-   2^63). */
+   2^31). */
 
-static u64 next_p2(u64 val) {
+static u32 next_p2(u32 val) {
 
-  u64 ret = 1;
+  u32 ret = 1;
   while (val > ret) ret <<= 1;
   return ret;
 
@@ -4762,66 +4738,6 @@ static u32 calculate_score(struct queue_entry* q) {
 
   }
 
-  u64 fuzz = q->n_fuzz;
-  u64 fuzz_total;
-
-  u32 n_paths, fuzz_mu;
-  u32 factor = 1;
-
-  switch (schedule) {
-
-    case EXPLORE: 
-      break;
-
-    case EXPLOIT:
-      factor = MAX_FACTOR;
-      break;
-
-    case COE:
-      fuzz_total = 0;
-      n_paths = 0;
-
-      struct queue_entry *queue_it = queue;	
-      while (queue_it) {
-        fuzz_total += queue_it->n_fuzz;
-        n_paths ++;
-        queue_it = queue_it->next;
-      }
-
-      fuzz_mu = fuzz_total / n_paths;
-      if (fuzz <= fuzz_mu) {
-        if (q->fuzz_level < 16)
-          factor = ((u32) (1 << q->fuzz_level));
-        else 
-          factor = MAX_FACTOR;
-      } else {
-        factor = 0;
-      }
-      break;
-    
-    case FAST:
-      if (q->fuzz_level < 16) {
-         factor = ((u32) (1 << q->fuzz_level)) / (fuzz == 0 ? 1 : fuzz); 
-      } else
-        factor = MAX_FACTOR / (fuzz == 0 ? 1 : next_p2 (fuzz));
-      break;
-
-    case LIN:
-      factor = q->fuzz_level / (fuzz == 0 ? 1 : fuzz); 
-      break;
-
-    case QUAD:
-      factor = q->fuzz_level * q->fuzz_level / (fuzz == 0 ? 1 : fuzz);
-      break;
-
-    default:
-      PFATAL ("Unkown Power Schedule");
-  }
-  if (factor > MAX_FACTOR) 
-    factor = MAX_FACTOR;
-
-  perf_score *= factor / POWER_BETA;
-
   /* Make sure that we don't go over limit. */
 
   if (perf_score > HAVOC_MAX_MULT * 100) perf_score = HAVOC_MAX_MULT * 100;
@@ -4836,7 +4752,7 @@ static u32 calculate_score(struct queue_entry* q) {
    attempted by afl-fuzz. This is used to avoid dupes in some of the
    deterministic fuzzing operations that follow bit flips. We also
    return 1 if xor_val is zero, which implies that the old and attempted new
-   vales are identical and the exec would be a waste of time. */
+   values are identical and the exec would be a waste of time. */
 
 static u8 could_be_bitflip(u32 xor_val) {
 
@@ -5048,7 +4964,7 @@ static u8 fuzz_one(char** argv) {
        possibly skip to them at the expense of already-fuzzed or non-favored
        cases. */
 
-    if ((queue_cur->fuzz_level > 0 || !queue_cur->favored) &&
+    if ((queue_cur->was_fuzzed || !queue_cur->favored) &&
         UR(100) < SKIP_TO_NEW_PROB) return 1;
 
   } else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
@@ -5057,7 +4973,7 @@ static u8 fuzz_one(char** argv) {
        The odds of skipping stuff are higher for already-fuzzed inputs and
        lower for never-fuzzed entries. */
 
-    if (queue_cycle > 1 && queue_cur->fuzz_level == 0) {
+    if (queue_cycle > 1 && !queue_cur->was_fuzzed) {
 
       if (UR(100) < SKIP_NFAV_NEW_PROB) return 1;
 
@@ -5157,20 +5073,11 @@ static u8 fuzz_one(char** argv) {
 
   orig_perf = perf_score = calculate_score(queue_cur);
 
-  if (perf_score == 0) goto abandon_entry;
+  /* Skip right away if -d is given, if we have done deterministic fuzzing on
+     this entry ourselves (was_fuzzed), or if it has gone through deterministic
+     testing in earlier, resumed runs (passed_det). */
 
-  /* Skip right away if -d is given, if it has not been chosen sufficiently
-     often to warrant the expensive deterministic stage (fuzz_level), or
-     if it has gone through deterministic testing in earlier, resumed runs
-     (passed_det). */
-
-  if (skip_deterministic 
-     || ((!queue_cur->passed_det) 
-        && perf_score < (
-              queue_cur->depth * 30 <= HAVOC_MAX_MULT * 100
-              ? queue_cur->depth * 30 
-              : HAVOC_MAX_MULT * 100))
-     || queue_cur->passed_det)
+  if (skip_deterministic || queue_cur->was_fuzzed || queue_cur->passed_det)
     goto havoc_stage;
 
   /* Skip deterministic fuzzing if exec path checksum puts this out of scope
@@ -6581,6 +6488,7 @@ havoc_stage:
       havoc_queued = queued_paths;
 
     }
+
   }
 
   new_hit_cnt = queued_paths + unique_crashes;
@@ -6694,12 +6602,11 @@ abandon_entry:
   /* Update pending_not_fuzzed count if we made it through the calibration
      cycle and have not seen this entry before. */
 
-  if (!stop_soon && !queue_cur->cal_failed && queue_cur->fuzz_level == 0) {
+  if (!stop_soon && !queue_cur->cal_failed && !queue_cur->was_fuzzed) {
+    queue_cur->was_fuzzed = 1;
     pending_not_fuzzed--;
     if (queue_cur->favored) pending_favored--;
   }
-
-  queue_cur->fuzz_level++;
 
   munmap(orig_in, queue_cur->len);
 
@@ -7047,6 +6954,7 @@ EXP_ST void check_binary(u8* fname) {
 
     OKF(cPIN "Deferred forkserver binary detected.");
     setenv(DEFER_ENV_VAR, "1", 1);
+    deferred_mode = 1;
 
   } else if (getenv("AFL_DEFER_FORKSRV")) {
 
@@ -7143,8 +7051,6 @@ static void usage(u8* argv0) {
 
        "Execution control settings:\n\n"
 
-       "  -p schedule   - power schedules recompute a seed's performance score.\n"
-       "                  <fast (default), coe, explore, lin, quad, or exploit>\n"
        "  -f file       - location read by the fuzzed program (stdin)\n"
        "  -t msec       - timeout for each run (auto-scaled, 50-%u ms)\n"
        "  -m megs       - memory limit for child process (%u MB)\n"
@@ -7699,6 +7605,10 @@ static char** get_qemu_argv(u8* own_loc, char** argv, int argc) {
   char** new_argv = ck_alloc(sizeof(char*) * (argc + 4));
   u8 *tmp, *cp, *rsl, *own_copy;
 
+  /* Workaround for a QEMU stability glitch. */
+
+  setenv("QEMU_LOG", "nochain", 1);
+
   memcpy(new_argv + 3, argv + 1, sizeof(char*) * argc);
 
   new_argv[2] = target_path;
@@ -7788,14 +7698,6 @@ static void save_cmdline(u32 argc, char** argv) {
 
 }
 
-int stricmp(char const *a, char const *b) {
-  int d;
-  for (;; a++, b++) {
-    d = tolower(*a) - tolower(*b);
-    if (d != 0 || !*a)
-      return d;
-  }
-}
 
 #ifndef AFL_LIB
 
@@ -7814,14 +7716,14 @@ int main(int argc, char** argv) {
   struct timeval tv;
   struct timezone tz;
 
-  SAYF(cCYA "afl-fuzz " cBRI VERSION cRST " by <lcamtuf@google.com>. Power schedules by <marcel.boehme@acm.org>\n");
+  SAYF(cCYA "afl-fuzz " cBRI VERSION cRST " by <lcamtuf@google.com>\n");
 
   doc_path = access(DOC_PATH, F_OK) ? "docs" : DOC_PATH;
 
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Qp:")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Q")) > 0)
 
     switch (opt) {
 
@@ -7989,22 +7891,6 @@ int main(int argc, char** argv) {
 
         break;
 
-      case 'p': /* Power schedule */
-        if (!stricmp(optarg, "fast")) {
-          schedule = FAST;
-        } else if (!stricmp(optarg, "coe")) {
-          schedule = COE;
-        } else if (!stricmp(optarg, "exploit")) {
-          schedule = EXPLOIT;
-        } else if (!stricmp(optarg, "lin")) {
-          schedule = LIN;
-        } else if (!stricmp(optarg, "quad")) {
-          schedule = QUAD;
-        } else if (!stricmp(optarg, "explore")) {
-          schedule = EXPLORE;
-        }
-        break;
-
       default:
 
         usage(argv[0]);
@@ -8026,16 +7912,6 @@ int main(int argc, char** argv) {
     if (crash_mode) FATAL("-C and -n are mutually exclusive");
     if (qemu_mode)  FATAL("-Q and -n are mutually exclusive");
 
-  }
-
-  switch (schedule) {
-    case FAST:    OKF ("Using exponential power schedule (FAST)"); break;
-    case COE:     OKF ("Using cut-off exponential power schedule (COE)"); break;
-    case EXPLOIT: OKF ("Using exploitation-based constant power schedule (EXPLOIT)"); break;
-    case LIN:     OKF ("Using linear power schedule (LIN)"); break;
-    case QUAD:    OKF ("Using quadratic power schedule (QUAD)"); break;
-    case EXPLORE: OKF ("Using exploration-based constant power schedule (EXPLORE)"); break;
-    default : FATAL ("Unkown power schedule"); break;
   }
 
   if (getenv("AFL_NO_FORKSRV"))    no_forkserver    = 1;
