@@ -1,3 +1,9 @@
+# Goal
+
+The goal of this repo is to merge AFLFast changes into the original AFL 2.52b.
+
+
+
 # AFLFast
 <a href="https://mboehme.github.io/paper/CCS16.pdf"><img src="https://mboehme.github.io/paper/CCS16.png" align="right" width="250"></a>
 Power schedules implemented by Marcel Böhme \<marcel.boehme@acm.org\>. 
